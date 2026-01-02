@@ -109,6 +109,12 @@ $env:RAPIDAPI_KEY="YOUR_KEY"
 python .\econ_release_notifier.py --lookahead-hours 24 --max-items 1
 ```
 
+### バージョン確認
+
+```powershell
+python .\econ_release_notifier.py --version
+```
+
 ### 文字化けする場合（Windows / PowerShell）
 
 環境によっては、日本語が文字化けすることがあります。以下はPowerShellでUTF-8表示に寄せる例です。

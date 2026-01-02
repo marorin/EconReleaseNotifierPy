@@ -25,6 +25,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # =========================
+# バージョン情報
+# =========================
+__version__ = "0.1.0"
+
+
+# =========================
 # 文字化け対策（Windows向け）
 # =========================
 def try_configure_stdio_utf8() -> None:
@@ -687,6 +693,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="econ_release_notifier.py",
         description="指定した経済指標の発表時刻までの残り時間を ntfy.sh に通知します（既定はdry-run）。",
+    )
+    p.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="バージョンを表示して終了します。",
     )
     p.add_argument(
         "--apply",
