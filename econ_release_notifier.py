@@ -13,10 +13,13 @@ Econ Release Notifier
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -27,7 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # =========================
 # バージョン情報
 # =========================
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 
 # =========================
@@ -64,7 +67,7 @@ DEFAULT_LOOKAHEAD_HOURS = 24
 MAX_LOOKAHEAD_HOURS = 168
 
 # 通知対象の最大件数（CLI: --max-items のデフォルト）
-DEFAULT_MAX_ITEMS = 1
+DEFAULT_MAX_ITEMS = 5
 
 # 同一イベントの最小通知間隔（分）（CLI: --min-interval-minutes のデフォルト）
 # cronで頻繁に回した場合でも、同じイベントの通知が短時間に連打されるのを抑止します。
@@ -73,6 +76,14 @@ DEFAULT_MIN_INTERVAL_MINUTES = 1
 # 1回の実行で実際に送る通知の最大件数（CLI: --max-notify-per-run のデフォルト）
 # 設定ミスやAPI異常などで「短時間に大量通知」になった場合の安全弁です。
 DEFAULT_MAX_NOTIFY_PER_RUN = 10
+
+# APIデバッグ: 保存する最大件数（1エンドポイントあたり）
+DEFAULT_DEBUG_API_SAVE_LIMIT = 50
+
+# APIデバッグ: 標準出力に出す生データの最大件数（1エンドポイントあたり）
+# - 大量に出力するとターミナルが重くなるため、既定は上限あり
+# - --debug-api-print-raw-limit -1 で全件出力
+DEFAULT_DEBUG_API_PRINT_RAW_LIMIT = 10
 
 # ntfy 通知先のデフォルト（CLIで上書き可能）
 # - server: ntfyサーバURL（CLI: --ntfy-server）
@@ -90,7 +101,7 @@ DEFAULT_NTFY_PRIORITY = "default"  # ntfy: min/low/default/high/max または 1-
 # 対象国のデフォルト（CLI: --country が未指定の場合に使用）
 # 指示: ISO 3166-1 alpha-2（2文字国コード）に準拠。
 # ※EU は国ではありませんが、経済指標API側で地域コードとして使われる想定のため含めます。
-DEFAULT_COUNTRIES: List[str] = ["US", "EU", "JP", "GB", "CA", "CH", "AU", "NZ"]
+DEFAULT_COUNTRIES: List[str] = ["US", "EU", "JP", "UK", "CA", "CH", "AU", "NZ"]
 
 # 指標名の部分一致キーワードのデフォルト（CLI: --match-keyword が未指定の場合に使用）
 # ここに含まれる文字列が「指標名に含まれる」場合、Match対象になります（Ignoreルールが最優先）。
@@ -106,17 +117,22 @@ DEFAULT_MATCH_KEYWORDS: List[str] = [
 
 # RapidAPI（Economic Calendar API）の接続先情報
 # - BASE: APIホスト（固定）
-# - ENDPOINTS: 指示書要件に従い this-week / next-week を取得してから時間窓で絞り込みます（固定）
+# - CALENDAR_ENDPOINT: /calendar で期間指定して取得→時間窓で絞り込みます
 # - HOST_HEADER: RapidAPIのHostヘッダ（固定）
 RAPIDAPI_BASE = "https://economic-calendar-api.p.rapidapi.com"
-RAPIDAPI_ENDPOINTS = [
-    "/calendar/history/this-week",
-    "/calendar/history/next-week",
-]
+RAPIDAPI_CALENDAR_ENDPOINT = "/calendar"
 RAPIDAPI_HOST_HEADER = "economic-calendar-api.p.rapidapi.com"
 
 # RapidAPIキーを読む環境変数名（CLI: --rapidapi-key が未指定の場合に参照）
+#
+# 重要: ここには「環境変数名」を入れます。APIキーそのものを直書きしないでください。
+# 例: PowerShell なら $env:RAPIDAPI_KEY="YOUR_KEY"
 ENV_RAPIDAPI_KEY = "RAPIDAPI_KEY"
+
+# （テスト用）コードに埋め込むRapidAPIキー
+# - 公開/共有する可能性がある場合は絶対に設定しないでください（漏洩します）。
+# - 優先順位: CLI(--rapidapi-key) > 環境変数(ENV_RAPIDAPI_KEY) > この定数
+DEFAULT_RAPIDAPI_KEY = ""
 
 # stateファイル名のデフォルト（CLI: --state が未指定の場合）
 # 通知済み情報を保存して重複通知を抑止します（--apply 実行時のみ更新）。
@@ -160,6 +176,11 @@ class Settings:
     max_items: int
     min_interval_minutes: int
     max_notify_per_run: int
+    debug_api: bool
+    debug_api_save_path: Optional[Path]
+    debug_api_save_limit: int
+    debug_api_print_raw: bool
+    debug_api_print_raw_limit: int
 
     countries: List[str]
     match_keywords: List[str]
@@ -231,6 +252,21 @@ def normalize_text(s: str) -> str:
     return " ".join(s.strip().split()).casefold()
 
 
+def strip_wrapping_quotes(s: str) -> str:
+    """
+    CLI入力の揺れ吸収:
+    - Windows(cmd.exe)では '...' がクォート扱いにならず、文字として残ることがある
+      例: --match-keyword 'ISM' → 値が "'ISM'" になるケース
+    - PowerShellでは通常クォートは剥がれるが、環境差に備えて安全側で除去する
+
+    両端が同じ種類のクォート（' または "）で囲まれている場合のみ外す。
+    """
+    t = s.strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in ("'", '"'):
+        return t[1:-1].strip()
+    return t
+
+
 def is_dangerous_path(p: Path) -> Tuple[bool, str]:
     """
     危険なパス例:
@@ -286,6 +322,47 @@ def write_json_file_atomic(path: Path, obj: Dict[str, Any]) -> None:
         raise SafeUsageError(f"stateファイルを書き込めません: {path}") from ex
 
 
+@contextmanager
+def acquire_state_lock(state_path: Path, timeout_sec: int = 30) -> Any:
+    """
+    同時実行（タスクスケジューラ等）で state が壊れるのを防ぐための簡易ロック。
+
+    - lockファイルを原子的に作成（open(mode="x")）できたプロセスだけが進む
+    - 一定時間（既定30秒）待っても取れなければ安全に停止する
+    """
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    started = time.monotonic()
+    while True:
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("x", encoding="utf-8", newline="\n") as f:
+                payload = {
+                    "pid": os.getpid(),
+                    "created_at_utc": utc_now().isoformat().replace("+00:00", "Z"),
+                    "state_path": str(state_path),
+                }
+                f.write(json.dumps(payload, ensure_ascii=False, indent=2))
+            break
+        except FileExistsError:
+            if time.monotonic() - started > timeout_sec:
+                raise SafeUsageError(
+                    "stateファイルのロック取得に失敗しました（同時実行の可能性）。\n"
+                    f"lock: {lock_path}\n"
+                    "危険: 同時に実行すると通知の重複やstate破損の可能性があります。"
+                )
+            time.sleep(0.2)
+    try:
+        yield
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # ロック解除に失敗しても、通知/更新自体は完了している可能性があるため例外化しない
+            pass
+
+
 # =========================
 # API 呼び出し
 # =========================
@@ -320,34 +397,144 @@ def http_get_json(url: str, headers: Dict[str, str], timeout_sec: int = 20) -> A
         ) from ex
 
 
-def fetch_events(settings: Settings) -> List[Dict[str, Any]]:
+def _extract_list_from_api_payload(payload: Any) -> List[Dict[str, Any]]:
+    """
+    API仕様の揺れに備えて、list/dictどちらでも受ける。
+    - listなら、そのまま dict要素だけ返す
+    - dictなら、よくあるキー（data/result/items/events）からlistを探す
+    """
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for k in ("data", "result", "items", "events"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+    raise SafeUsageError(
+        "APIの応答形式が想定外です（list/dictではありません）。\n"
+        "危険: API仕様変更の可能性があります。READMEのAPIリンクを確認してください。"
+    )
+
+
+def _make_safe_debug_path(p: Path, project_dir: Path) -> Path:
+    out = p
+    if not out.is_absolute():
+        out = project_dir / out
+    danger, reason = is_dangerous_path(out)
+    if danger:
+        raise SafeUsageError(
+            f"debug出力パスが危険なため停止します: {out}\n理由: {reason}\n"
+            "危険: 誤って重要な場所にファイルを作成/上書きする可能性があります。"
+        )
+    return out
+
+
+def fetch_events(settings: Settings, project_dir: Path) -> List[Dict[str, Any]]:
     headers = {
         "X-RapidAPI-Key": settings.rapidapi_key,
         "X-RapidAPI-Host": RAPIDAPI_HOST_HEADER,
         "Accept": "application/json",
     }
-    out: List[Dict[str, Any]] = []
-    for ep in RAPIDAPI_ENDPOINTS:
-        url = RAPIDAPI_BASE + ep
-        data = http_get_json(url, headers=headers)
+    now_utc = settings.now_override_utc or utc_now()
+    end_utc = now_utc + timedelta(hours=settings.lookahead_hours)
+    start_date = to_utc(now_utc).date().isoformat()
+    end_date = to_utc(end_utc).date().isoformat()
 
-        # API仕様の揺れに備えて、list/dictどちらでも受ける
-        if isinstance(data, list):
-            out.extend([x for x in data if isinstance(x, dict)])
-        elif isinstance(data, dict):
-            # よくある形: {"data":[...]} など
-            for k in ("data", "result", "items", "events"):
-                v = data.get(k)
-                if isinstance(v, list):
-                    out.extend([x for x in v if isinstance(x, dict)])
-                    break
-        else:
-            # 期待外は無視しつつ安全に止める
-            raise SafeUsageError(
-                "APIの応答形式が想定外です（list/dictではありません）。\n"
-                "危険: API仕様変更の可能性があります。READMEのAPIリンクを確認してください。"
+    out: List[Dict[str, Any]] = []
+    debug_endpoints: List[Dict[str, Any]] = []
+
+    # 期間指定で取得できる /calendar を使う
+    if not settings.countries:
+        raise SafeUsageError("内部エラー: countries が空です。")
+
+    for c in settings.countries:
+        api_cc = api_query_country_code(c)
+        query = urllib.parse.urlencode(
+            {
+                "countryCode": api_cc,
+                "startDate": start_date,
+                "endDate": end_date,
+            }
+        )
+        ep = f"{RAPIDAPI_CALENDAR_ENDPOINT}?{query}"
+        url = RAPIDAPI_BASE + ep
+        payload = http_get_json(url, headers=headers)
+        items = _extract_list_from_api_payload(payload)
+        out.extend(items)
+
+        if settings.debug_api_print_raw:
+            limit = int(settings.debug_api_print_raw_limit)
+            if limit == 0:
+                pass
+            else:
+                to_print = items if limit < 0 else items[:limit]
+                truncated = limit >= 0 and len(items) > len(to_print)
+                print("=== API 生データ（フィルタ前）===")
+                print(f"- endpoint: {ep}")
+                print(f"- URL: {url}")
+                print(f"- 件数: {len(items)}")
+                if truncated:
+                    print(f"- 出力: 先頭{len(to_print)}件のみ（全件出力は --debug-api-print-raw-limit -1）")
+                else:
+                    print("- 出力: 全件")
+                print(json.dumps(to_print, ensure_ascii=False, indent=2))
+                print("================================")
+
+        if settings.debug_api:
+            sample_keys: List[str] = []
+            if items:
+                sample_keys = sorted([str(k) for k in items[0].keys()])[:30]
+            debug_endpoints.append(
+                {
+                    "url": url,
+                    "items_count": len(items),
+                    "sample_keys_first_item": sample_keys,
+                }
             )
-    return out
+
+            if settings.debug_api_save_path:
+                limit = max(0, int(settings.debug_api_save_limit))
+                debug_endpoints[-1]["sample_items"] = items[:limit]
+
+    # 同一イベントが重複して返る可能性があるため、idで軽く重複排除する
+    deduped: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for it in out:
+        _id = it.get("id")
+        if isinstance(_id, str) and _id:
+            if _id in seen_ids:
+                continue
+            seen_ids.add(_id)
+        deduped.append(it)
+
+    if settings.debug_api:
+        print("=== APIデバッグ ===")
+        for d in debug_endpoints:
+            print(f"- URL: {d.get('url')}")
+            print(f"  取得件数: {d.get('items_count')}")
+            if d.get("sample_keys_first_item"):
+                print(f"  先頭アイテムのキー例: {d.get('sample_keys_first_item')}")
+        print(f"- 合計取得件数: {len(deduped)}")
+        if len(deduped) == 0:
+            print(
+                "補足: API取得が0件です。\n"
+                f"- country: {settings.countries}\n"
+                f"- startDate: {start_date}\n"
+                f"- endDate  : {end_date}\n"
+                "可能性: その期間にイベントが無い / APIが未来期間のデータをまだ提供していない / countryCode指定が不一致"
+            )
+        print("===============")
+
+        if settings.debug_api_save_path:
+            out_path = _make_safe_debug_path(settings.debug_api_save_path, project_dir=project_dir)
+            debug_payload = {
+                "fetched_at_utc": utc_now().isoformat().replace("+00:00", "Z"),
+                "note": "APIキー等のヘッダは保存していません。sample_itemsはサイズ抑制のため先頭N件のみです。",
+                "endpoints": debug_endpoints,
+            }
+            write_json_file_atomic(out_path, debug_payload)
+            print(f"APIデバッグ情報を保存しました: {out_path}")
+    return deduped
 
 
 # =========================
@@ -356,6 +543,7 @@ def fetch_events(settings: Settings) -> List[Dict[str, Any]]:
 def extract_event_datetime_utc(raw: Dict[str, Any]) -> Optional[datetime]:
     """
     可能性のあるキー:
+    - "dateUtc", "periodDateUtc"（Economic Calendar APIの実データで確認）
     - "datetime", "dateTime", "time"
     - "date" + "time"
     - "timestamp" (秒/ミリ秒)
@@ -371,7 +559,16 @@ def extract_event_datetime_utc(raw: Dict[str, Any]) -> Optional[datetime]:
             return None
 
     # datetime text
-    for k in ("datetime", "dateTime", "date_time", "eventTime", "event_time", "time"):
+    for k in (
+        "dateUtc",
+        "periodDateUtc",
+        "datetime",
+        "dateTime",
+        "date_time",
+        "eventTime",
+        "event_time",
+        "time",
+    ):
         v = raw.get(k)
         if isinstance(v, str) and v.strip():
             try:
@@ -416,6 +613,42 @@ def extract_country(raw: Dict[str, Any]) -> str:
     return "(unknown country)"
 
 
+def canonical_country_code(country: str) -> str:
+    """
+    API/運用上の揺れを吸収するための正規化。
+
+    - APIは UK を返すことがある
+    - ISO 3166-1 alpha-2 では GB が正式だが、ユーザー指定が GB/UK どちらでも動くようにする
+    """
+    c = country.strip().upper()
+
+    # UK/GB 揺れ（APIはUKを返すことがある）
+    if c == "GB":
+        return "UK"
+
+    # EU/Eurozone 揺れ（保守的に、確認できたものだけ吸収）
+    # - ISOの「EU」は国コードとしては未定義
+    # - 本APIではユーロ圏を EMU として返すことがある（取得結果で確認）
+    # - EA/EZ などは他APIで見かけることがあるが、誤判定リスクを避けるためここでは扱わない
+    if c in ("EMU",):
+        return "EU"
+
+    return c
+
+
+def api_query_country_code(country: str) -> str:
+    """
+    APIへ投げるcountryCodeに変換する。
+
+    内部ではフィルタの都合で EU を使うが、このAPIはユーロ圏を EMU として返すことがあるため、
+    取得リクエストでは EMU を使う。
+    """
+    c = canonical_country_code(country)
+    if c == "EU":
+        return "EMU"
+    return c
+
+
 def build_events(raw_items: List[Dict[str, Any]]) -> List[Event]:
     events: List[Event] = []
     for raw in raw_items:
@@ -428,7 +661,7 @@ def build_events(raw_items: List[Dict[str, Any]]) -> List[Event]:
         events.append(
             Event(
                 name=extract_event_name(raw),
-                country=extract_country(raw),
+                country=canonical_country_code(extract_country(raw)),
                 time_utc=dt_utc,
                 raw=raw,
             )
@@ -437,9 +670,9 @@ def build_events(raw_items: List[Dict[str, Any]]) -> List[Event]:
 
 
 def country_matches(event_country: str, allowed: List[str]) -> bool:
-    ec = normalize_text(event_country)
+    ec = canonical_country_code(event_country)
     for a in allowed:
-        if ec == normalize_text(a):
+        if ec == canonical_country_code(a):
             return True
     return False
 
@@ -453,10 +686,10 @@ def event_matches_keywords(name: str, keywords: List[str]) -> bool:
 
 
 def rule_matches(country: str, name: str, rules: List[MatchRule]) -> bool:
-    c = normalize_text(country)
+    c = canonical_country_code(country)
     n = normalize_text(name)
     for r in rules:
-        if c == normalize_text(r.country) and normalize_text(r.name_contains) in n:
+        if c == canonical_country_code(r.country) and normalize_text(r.name_contains) in n:
             return True
     return False
 
@@ -508,6 +741,15 @@ def format_dt_pair(dt_utc: datetime) -> Tuple[str, str]:
     )
 
 
+def format_dt_message(dt: datetime) -> str:
+    """
+    通知本文向けの表示形式（秒/タイムゾーン表記を省略）:
+    - YYYY-MM-DD H:MM（hourは先頭ゼロなし）
+    """
+    d = dt.date().isoformat()
+    return f"{d} {dt.hour}:{dt.minute:02d}"
+
+
 def humanize_timedelta(td: timedelta) -> str:
     total = int(td.total_seconds())
     if total < 0:
@@ -525,7 +767,11 @@ def humanize_timedelta(td: timedelta) -> str:
 
 def build_message(now_utc: datetime, ev: Event) -> str:
     now_utc = to_utc(now_utc)
-    utc_s, jst_s = format_dt_pair(ev.time_utc)
+    jst = timezone(timedelta(hours=9))
+    dt_utc = to_utc(ev.time_utc)
+    dt_jst = dt_utc.astimezone(jst)
+    utc_s = format_dt_message(dt_utc)
+    jst_s = format_dt_message(dt_jst)
     remain = ev.time_utc - now_utc
     return (
         f"対象: {ev.name}\n"
@@ -678,9 +924,20 @@ def parse_rules(texts: List[str], kind: str) -> List[MatchRule]:
     """
     rules: List[MatchRule] = []
     for t in texts:
-        if "|" not in t:
-            raise SafeUsageError(f"{kind} の形式が不正です: {t!r} (例: \"United States|CPI\")")
-        c, n = t.split("|", 1)
+        # README/Markdown表記や環境差（PowerShell等）で区切りが揺れることがあるため吸収する。
+        # - Markdownでは `|` が表の区切りに使われるため `\|` と書かれることがある
+        # - 全角の `｜` が混ざることがある
+        s = t.replace("｜", "|")
+        # 連続バックスラッシュ等で "\|" が複数回現れるケースも吸収する
+        while "\\|" in s:
+            s = s.replace("\\|", "|")
+        if "|" not in s:
+            raise SafeUsageError(
+                f"{kind} の形式が不正です: {t!r}\n"
+                "形式: \"Country|name_contains\" 例: \"US|ISM\"\n"
+                "PowerShell注意: | はパイプなので、必ず \"US|ISM\" のようにクォートしてください。"
+            )
+        c, n = s.split("|", 1)
         c = c.strip()
         n = n.strip()
         if not c or not n:
@@ -734,6 +991,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MAX_NOTIFY_PER_RUN,
         help=f"1回の実行で実際に送る通知の最大件数。既定{DEFAULT_MAX_NOTIFY_PER_RUN}。",
+    )
+    p.add_argument(
+        "--debug-api",
+        action="store_true",
+        help="API取得結果のデバッグ情報（取得件数/キー例）を表示します。",
+    )
+    p.add_argument(
+        "--debug-api-print-raw",
+        action="store_true",
+        help="フィルタ前のAPI生データ（取得したレスポンス）を標準出力へJSONで表示します。",
+    )
+    p.add_argument(
+        "--debug-api-print-raw-limit",
+        type=int,
+        default=DEFAULT_DEBUG_API_PRINT_RAW_LIMIT,
+        help=f"--debug-api-print-raw で出力する件数上限（1エンドポイントあたり）。既定{DEFAULT_DEBUG_API_PRINT_RAW_LIMIT}（-1で全件、0で出力しない）。",
+    )
+    p.add_argument(
+        "--debug-api-save",
+        type=str,
+        default=None,
+        help="APIデバッグ情報（エンドポイントごとのサンプル）をJSONで保存します（上書き）。例: api_debug.json",
+    )
+    p.add_argument(
+        "--debug-api-save-limit",
+        type=int,
+        default=DEFAULT_DEBUG_API_SAVE_LIMIT,
+        help=f"--debug-api-save 時に保存するサンプル件数（1エンドポイントあたり）。既定{DEFAULT_DEBUG_API_SAVE_LIMIT}。",
     )
     p.add_argument(
         "--country",
@@ -800,12 +1085,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def validate_settings(args: argparse.Namespace, project_dir: Path) -> Settings:
     # RapidAPI key
-    rapidapi_key = args.rapidapi_key or os.environ.get(ENV_RAPIDAPI_KEY)
+    rapidapi_key = args.rapidapi_key or os.environ.get(ENV_RAPIDAPI_KEY) or DEFAULT_RAPIDAPI_KEY
     if not rapidapi_key:
         raise SafeUsageError(
             "RapidAPIキーが未設定です。\n"
             f"設定方法: --rapidapi-key で指定するか、環境変数 {ENV_RAPIDAPI_KEY} を設定してください。"
         )
+    # DEFAULT_RAPIDAPI_KEY は基本空（埋め込みを避ける）
 
     # lookahead
     h = int(args.lookahead_hours)
@@ -829,12 +1115,22 @@ def validate_settings(args: argparse.Namespace, project_dir: Path) -> Settings:
     if mnr <= 0 or mnr > 200:
         raise SafeUsageError("max-notify-per-run が不正です（1〜200の範囲で指定してください）")
 
+    # debug api save limit
+    ds_limit = int(args.debug_api_save_limit)
+    if ds_limit < 0 or ds_limit > 1000:
+        raise SafeUsageError("debug-api-save-limit が不正です（0〜1000の範囲で指定してください）")
+
+    # debug api print raw limit
+    pr_limit = int(args.debug_api_print_raw_limit)
+    if pr_limit < -1 or pr_limit > 10000:
+        raise SafeUsageError("debug-api-print-raw-limit が不正です（-1〜10000の範囲で指定してください）")
+
     # now override
     now_override = parse_datetime_to_utc(args.now) if args.now else None
 
     # lists
-    countries = args.country if args.country else list(DEFAULT_COUNTRIES)
-    match_keywords = args.match_keyword if args.match_keyword else list(DEFAULT_MATCH_KEYWORDS)
+    countries = [strip_wrapping_quotes(x) for x in (args.country if args.country else list(DEFAULT_COUNTRIES))]
+    match_keywords = [strip_wrapping_quotes(x) for x in (args.match_keyword if args.match_keyword else list(DEFAULT_MATCH_KEYWORDS))]
     match_rules = parse_rules(args.match, "match") if args.match else []
     ignore_rules = [IgnoreRule(r.country, r.name_contains) for r in parse_rules(args.ignore, "ignore")] if args.ignore else []
 
@@ -864,6 +1160,11 @@ def validate_settings(args: argparse.Namespace, project_dir: Path) -> Settings:
         max_items=mi,
         min_interval_minutes=min_int,
         max_notify_per_run=mnr,
+        debug_api=bool(args.debug_api),
+        debug_api_save_path=Path(args.debug_api_save) if args.debug_api_save else None,
+        debug_api_save_limit=ds_limit,
+        debug_api_print_raw=bool(args.debug_api_print_raw),
+        debug_api_print_raw_limit=pr_limit,
         countries=countries,
         match_keywords=match_keywords,
         match_rules=match_rules,
@@ -916,54 +1217,63 @@ def main(argv: Optional[List[str]] = None) -> int:
         now_utc = settings.now_override_utc or utc_now()
         print_plan(settings, now_utc)
 
-        raw_items = fetch_events(settings)
+        raw_items = fetch_events(settings, project_dir=project_dir)
         events = build_events(raw_items)
+        if settings.debug_api:
+            print(f"=== パース結果 ===\n- イベント件数（日時パース成功）: {len(events)}\n===============")
         targets = apply_filters(settings, events)
 
         if not targets:
             print("対象となる指標がありません（通知しません）。")
             return 0
 
-        state = load_state(settings.state_path)
+        def _run_with_state(state: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+            any_sent = False
+            sent_count = 0
+            for ev in targets:
+                if sent_count >= settings.max_notify_per_run:
+                    print(f"1実行あたり最大通知数に達したため以降は送信しません: {settings.max_notify_per_run}")
+                    break
 
-        any_sent = False
-        sent_count = 0
-        for ev in targets:
-            if sent_count >= settings.max_notify_per_run:
-                print(f"1実行あたり最大通知数に達したため以降は送信しません: {settings.max_notify_per_run}")
-                break
+                skip, remaining = should_skip_due_to_min_interval(
+                    state=state,
+                    ev=ev,
+                    now_utc=now_utc,
+                    min_interval_minutes=settings.min_interval_minutes,
+                )
+                if skip:
+                    if remaining is not None:
+                        print(f"同一イベントの最小通知間隔により抑止しました（残り約{remaining}秒）: {ev.key}")
+                    else:
+                        print(f"同一イベントの最小通知間隔により抑止しました: {ev.key}")
+                    continue
 
-            skip, remaining = should_skip_due_to_min_interval(
-                state=state,
-                ev=ev,
-                now_utc=now_utc,
-                min_interval_minutes=settings.min_interval_minutes,
-            )
-            if skip:
-                if remaining is not None:
-                    print(f"同一イベントの最小通知間隔により抑止しました（残り約{remaining}秒）: {ev.key}")
+                msg = build_message(now_utc, ev)
+                print("--- 通知メッセージ ---")
+                print(msg.rstrip())
+                print("----------------------")
+
+                if settings.apply:
+                    ntfy_send(settings, msg)
+                    state = update_state_after_send(state, ev, now_utc=now_utc)
+                    any_sent = True
+                    sent_count += 1
                 else:
-                    print(f"同一イベントの最小通知間隔により抑止しました: {ev.key}")
-                continue
+                    print("dry-runのため通知送信は行いません（--applyで実送信）。")
+            return any_sent, state
 
-            msg = build_message(now_utc, ev)
-            print("--- 通知メッセージ ---")
-            print(msg.rstrip())
-            print("----------------------")
-
-            if settings.apply:
-                ntfy_send(settings, msg)
-                state = update_state_after_send(state, ev, now_utc=now_utc)
-                any_sent = True
-                sent_count += 1
-            else:
-                print("dry-runのため通知送信は行いません（--applyで実送信）。")
-
-        if settings.apply and any_sent:
-            write_json_file_atomic(settings.state_path, state)
-            print(f"stateを更新しました: {settings.state_path}")
-        elif settings.apply and not any_sent:
-            print("送信対象がありません（重複抑止など）: stateは更新しません。")
+        if settings.apply:
+            with acquire_state_lock(settings.state_path):
+                state = load_state(settings.state_path)
+                any_sent, state = _run_with_state(state)
+                if any_sent:
+                    write_json_file_atomic(settings.state_path, state)
+                    print(f"stateを更新しました: {settings.state_path}")
+                else:
+                    print("送信対象がありません（重複抑止など）: stateは更新しません。")
+        else:
+            state = load_state(settings.state_path)
+            _any_sent, _state = _run_with_state(state)
 
         return 0
 

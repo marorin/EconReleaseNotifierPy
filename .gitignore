@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.txt
+
+# 実行時生成物（コミットしない）
+er.state.json
+er.state.json.lock
+*.tmp
+*_api_debug*.json
+api_debug*.json
+
