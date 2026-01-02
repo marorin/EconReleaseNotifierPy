@@ -60,12 +60,23 @@ MAX_LOOKAHEAD_HOURS = 168
 # 通知対象の最大件数（CLI: --max-items のデフォルト）
 DEFAULT_MAX_ITEMS = 1
 
+# 同一イベントの最小通知間隔（分）（CLI: --min-interval-minutes のデフォルト）
+# cronで頻繁に回した場合でも、同じイベントの通知が短時間に連打されるのを抑止します。
+DEFAULT_MIN_INTERVAL_MINUTES = 1
+
+# 1回の実行で実際に送る通知の最大件数（CLI: --max-notify-per-run のデフォルト）
+# 設定ミスやAPI異常などで「短時間に大量通知」になった場合の安全弁です。
+DEFAULT_MAX_NOTIFY_PER_RUN = 10
+
 # ntfy 通知先のデフォルト（CLIで上書き可能）
 # - server: ntfyサーバURL（CLI: --ntfy-server）
 # - topic : 通知トピック名（CLI: --ntfy-topic）
 # - title : 通知タイトル（CLI: --ntfy-title）
 # - priority: 優先度（CLI: --ntfy-priority）
 DEFAULT_NTFY_SERVER = "https://ntfy.sh"
+# 注意: ntfyのトピック名(DEFAULT_NTFY_TOPIC)は「購読/投稿の識別子」でもあります。
+# 推測しやすい/他と被るトピック名を使うと、第三者が同じトピックへ投稿できる可能性があります。
+# 運用する場合は、十分に複雑で被りにくいトピック名に変更してください（README参照）。
 DEFAULT_NTFY_TOPIC = "econ-release-notifier"
 DEFAULT_NTFY_TITLE = "Econ Release Notifier"
 DEFAULT_NTFY_PRIORITY = "default"  # ntfy: min/low/default/high/max または 1-5
@@ -97,6 +108,9 @@ RAPIDAPI_ENDPOINTS = [
     "/calendar/history/next-week",
 ]
 RAPIDAPI_HOST_HEADER = "economic-calendar-api.p.rapidapi.com"
+
+# RapidAPIキーを読む環境変数名（CLI: --rapidapi-key が未指定の場合に参照）
+ENV_RAPIDAPI_KEY = "RAPIDAPI_KEY"
 
 # stateファイル名のデフォルト（CLI: --state が未指定の場合）
 # 通知済み情報を保存して重複通知を抑止します（--apply 実行時のみ更新）。
@@ -138,6 +152,8 @@ class Settings:
 
     lookahead_hours: int
     max_items: int
+    min_interval_minutes: int
+    max_notify_per_run: int
 
     countries: List[str]
     match_keywords: List[str]
@@ -552,34 +568,96 @@ def ntfy_send(settings: Settings, message: str) -> None:
 def load_state(path: Path) -> Dict[str, Any]:
     state = read_json_file(path)
     if not state:
-        return {"notified": [], "last_notified_time_utc": None}
-    # 最低限の形に整形
-    if "notified" not in state or not isinstance(state.get("notified"), list):
-        state["notified"] = []
+        return {"events": {}, "last_notified_time_utc": None}
+
+    # 最低限の形に整形（新形式: events）
+    if "events" not in state or not isinstance(state.get("events"), dict):
+        state["events"] = {}
+
+    # 旧形式（notified配列）からの読み替え:
+    # - 旧形式は「同一イベントは永続抑止」だったため、単純移行すると厳しすぎます。
+    # - かといって、アップデート直後に即再通知されると混乱するため、
+    #   初回だけ「今通知した扱い」にして min-interval で短時間の再通知を抑止します。
+    if isinstance(state.get("notified"), list) and state.get("notified"):
+        now_s = utc_now().isoformat().replace("+00:00", "Z")
+        for k in state.get("notified", []):
+            if isinstance(k, str) and k not in state["events"]:
+                state["events"][k] = {"last_notified_at_utc": now_s}
+
     if "last_notified_time_utc" not in state:
         state["last_notified_time_utc"] = None
     return state
 
 
-def is_already_notified(state: Dict[str, Any], ev: Event) -> bool:
-    notified = state.get("notified", [])
-    if isinstance(notified, list) and ev.key in notified:
-        return True
-    return False
+def parse_utc_iso(text: str) -> Optional[datetime]:
+    s = text.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
-def update_state_after_send(state: Dict[str, Any], ev: Event) -> Dict[str, Any]:
-    notified = state.get("notified", [])
-    if not isinstance(notified, list):
-        notified = []
-    if ev.key not in notified:
-        notified.append(ev.key)
+def should_skip_due_to_min_interval(
+    state: Dict[str, Any],
+    ev: Event,
+    now_utc: datetime,
+    min_interval_minutes: int,
+) -> Tuple[bool, Optional[int]]:
+    """
+    returns: (skip?, remaining_seconds_if_skipped)
+    """
+    if min_interval_minutes <= 0:
+        return False, None
+
+    events = state.get("events", {})
+    if not isinstance(events, dict):
+        return False, None
+    entry = events.get(ev.key)
+    if not isinstance(entry, dict):
+        return False, None
+    last_s = entry.get("last_notified_at_utc")
+    if not isinstance(last_s, str):
+        return False, None
+
+    last_dt = parse_utc_iso(last_s)
+    if last_dt is None:
+        return False, None
+
+    now_utc = to_utc(now_utc)
+    delta = now_utc - last_dt
+    if delta.total_seconds() < min_interval_minutes * 60:
+        remaining = int(min_interval_minutes * 60 - delta.total_seconds())
+        if remaining < 0:
+            remaining = 0
+        return True, remaining
+    return False, None
+
+
+def update_state_after_send(state: Dict[str, Any], ev: Event, now_utc: datetime) -> Dict[str, Any]:
+    events = state.get("events")
+    if not isinstance(events, dict):
+        events = {}
+        state["events"] = events
+
+    # 同一イベントの最終通知時刻（UTC）
+    events[ev.key] = {"last_notified_at_utc": to_utc(now_utc).isoformat().replace("+00:00", "Z")}
 
     # 無制限肥大化を避ける（最新500件まで保持）
-    if len(notified) > 500:
-        notified = notified[-500:]
+    if len(events) > 500:
+        # eventsは順序保証されないため、古いものを正確に落とすことは難しい。
+        # ここでは安全側に「適当に間引く」だけに留めます（頻繁に500超になる運用は想定しない）。
+        for i, k in enumerate(list(events.keys())):
+            if i >= len(events) - 500:
+                break
+            events.pop(k, None)
 
-    state["notified"] = notified
     state["last_notified_time_utc"] = ev.time_utc.isoformat().replace("+00:00", "Z")
     return state
 
@@ -632,6 +710,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MAX_ITEMS,
         help=f"通知対象の最大件数（発表が近い順、既定{DEFAULT_MAX_ITEMS}）。",
+    )
+    p.add_argument(
+        "--min-interval-minutes",
+        type=int,
+        default=DEFAULT_MIN_INTERVAL_MINUTES,
+        help=f"同一イベントの最小通知間隔（分）。既定{DEFAULT_MIN_INTERVAL_MINUTES}（0で無効）。",
+    )
+    p.add_argument(
+        "--max-notify-per-run",
+        type=int,
+        default=DEFAULT_MAX_NOTIFY_PER_RUN,
+        help=f"1回の実行で実際に送る通知の最大件数。既定{DEFAULT_MAX_NOTIFY_PER_RUN}。",
     )
     p.add_argument(
         "--country",
@@ -691,18 +781,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--rapidapi-key",
         type=str,
         default=None,
-        help="RapidAPIキー。未指定の場合は環境変数 RAPIDAPI_KEY を参照。",
+        help=f"RapidAPIキー。未指定の場合は環境変数 {ENV_RAPIDAPI_KEY} を参照。",
     )
     return p
 
 
 def validate_settings(args: argparse.Namespace, project_dir: Path) -> Settings:
     # RapidAPI key
-    rapidapi_key = args.rapidapi_key or os.environ.get("RAPIDAPI_KEY")
+    rapidapi_key = args.rapidapi_key or os.environ.get(ENV_RAPIDAPI_KEY)
     if not rapidapi_key:
         raise SafeUsageError(
             "RapidAPIキーが未設定です。\n"
-            "設定方法: --rapidapi-key で指定するか、環境変数 RAPIDAPI_KEY を設定してください。"
+            f"設定方法: --rapidapi-key で指定するか、環境変数 {ENV_RAPIDAPI_KEY} を設定してください。"
         )
 
     # lookahead
@@ -716,6 +806,16 @@ def validate_settings(args: argparse.Namespace, project_dir: Path) -> Settings:
     mi = int(args.max_items)
     if mi <= 0 or mi > 50:
         raise SafeUsageError("max-items が不正です（1〜50の範囲で指定してください）")
+
+    # min interval minutes
+    min_int = int(args.min_interval_minutes)
+    if min_int < 0 or min_int > 24 * 60:
+        raise SafeUsageError("min-interval-minutes が不正です（0〜1440の範囲で指定してください）")
+
+    # max notify per run
+    mnr = int(args.max_notify_per_run)
+    if mnr <= 0 or mnr > 200:
+        raise SafeUsageError("max-notify-per-run が不正です（1〜200の範囲で指定してください）")
 
     # now override
     now_override = parse_datetime_to_utc(args.now) if args.now else None
@@ -750,6 +850,8 @@ def validate_settings(args: argparse.Namespace, project_dir: Path) -> Settings:
         rapidapi_key=rapidapi_key,
         lookahead_hours=h,
         max_items=mi,
+        min_interval_minutes=min_int,
+        max_notify_per_run=mnr,
         countries=countries,
         match_keywords=match_keywords,
         match_rules=match_rules,
@@ -780,6 +882,8 @@ def print_plan(settings: Settings, now_utc: datetime) -> None:
     print(f"- 追加matchルール: {[f'{r.country}|{r.name_contains}' for r in settings.match_rules]}")
     print(f"- ignoreルール: {[f'{r.country}|{r.name_contains}' for r in settings.ignore_rules]}")
     print(f"- 通知最大件数: {settings.max_items}")
+    print(f"- 同一イベント最小通知間隔(分): {settings.min_interval_minutes}")
+    print(f"- 1実行あたり最大通知数: {settings.max_notify_per_run}")
     print(f"- ntfy: {settings.ntfy_server.rstrip('/')}/{settings.ntfy_topic} (Title={settings.ntfy_title}, Priority={settings.ntfy_priority})")
     print(f"- stateファイル: {settings.state_path}")
     print("==============================")
@@ -811,9 +915,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         state = load_state(settings.state_path)
 
         any_sent = False
+        sent_count = 0
         for ev in targets:
-            if is_already_notified(state, ev):
-                print(f"重複通知を抑止しました: {ev.key}")
+            if sent_count >= settings.max_notify_per_run:
+                print(f"1実行あたり最大通知数に達したため以降は送信しません: {settings.max_notify_per_run}")
+                break
+
+            skip, remaining = should_skip_due_to_min_interval(
+                state=state,
+                ev=ev,
+                now_utc=now_utc,
+                min_interval_minutes=settings.min_interval_minutes,
+            )
+            if skip:
+                if remaining is not None:
+                    print(f"同一イベントの最小通知間隔により抑止しました（残り約{remaining}秒）: {ev.key}")
+                else:
+                    print(f"同一イベントの最小通知間隔により抑止しました: {ev.key}")
                 continue
 
             msg = build_message(now_utc, ev)
@@ -823,8 +941,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             if settings.apply:
                 ntfy_send(settings, msg)
-                state = update_state_after_send(state, ev)
+                state = update_state_after_send(state, ev, now_utc=now_utc)
                 any_sent = True
+                sent_count += 1
             else:
                 print("dry-runのため通知送信は行いません（--applyで実送信）。")
 
