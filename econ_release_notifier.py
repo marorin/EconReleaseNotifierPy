@@ -63,7 +63,7 @@ def try_configure_stdio_utf8() -> None:
 # 何時間先までのイベントを対象にするか（CLI: --lookahead-hours のデフォルト）
 DEFAULT_LOOKAHEAD_HOURS = 24
 # 何時間先までのイベントを許可するか（CLI: --lookahead-hours の最大）
-# 指示書要件: 最大168（= 7日）
+# 最大168（= 7日）
 MAX_LOOKAHEAD_HOURS = 168
 
 # 通知対象の最大件数（CLI: --max-items のデフォルト）
@@ -243,7 +243,7 @@ def parse_datetime_to_utc(text: str) -> datetime:
         ) from ex
 
     if dt.tzinfo is None:
-        # 指示書が「内部はUTC基準」なので、曖昧入力はUTC扱いに固定
+        # 内部はUTC基準なので、曖昧入力はUTC扱いに固定
         dt = dt.replace(tzinfo=timezone.utc)
     return to_utc(dt)
 

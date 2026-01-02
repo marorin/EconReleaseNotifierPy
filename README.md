@@ -47,6 +47,16 @@
 - ntfy Androidアプリ: `https://play.google.com/store/apps/details?id=io.heckel.ntfy`
 - ntfy iOSアプリ: `https://apps.apple.com/app/ntfy/id1625396347`
 
+### Economic Calendar API
+- 経済指標データAPIサービスです。月100件のリクエスト・月10240MBまで無料で使えます。
+- RapidAPIから提供されていてアカウントはRapidAPIと共通。代理店（Economic）と卸元（Rapid）の関係。
+- RapidAPI内で検索すると似たような名前のAPIがたくさんヒットしますが、全く同じ仕様のものもあれば微妙に異なるものもあるため注意して下さい。API Creator名が"Market Reaper"のEconomic Calendarを当スクリプトは使っています。
+
+### ntfy
+- スマートフォンやPCにプッシュ通知を送るための、無料でオープンソースのHTTPベース「Pub/Sub（Publish/Subscribe）サービスです。
+- アカウント不要で簡単なHTTPリクエスト（PUT/POST）でメッセージを送信し、対応するアプリで購読（Subscribe）すると、Webやアプリを通じて即座に通知を受け取れます。
+- 自前でサーバーを立てて利用も可
+
 ## インストール
 
 依存は標準ライブラリのみです（追加パッケージ不要）。
@@ -76,6 +86,19 @@
 |`--ntfy-priority`|str|優先度（`min/low/default/high/max` または `1-5`）|`default`|
 |`--state`|str|stateファイルパス（相対ならスクリプト同階層基準）|`er.state.json`|
 |`--rapidapi-key`|str|RapidAPIキー（未指定なら `RAPIDAPI_KEY` を参照）|未指定|
+
+### 運用のコツ（慣れてきた人向け）: デフォルト値をコード側で育てる
+
+CLIで毎回 `--country` や `--match-keyword` を指定するのが煩雑になってきたら、`econ_release_notifier.py` 冒頭付近の以下を**積極的に書き換えて運用**するのがおすすめです。
+
+- **`DEFAULT_COUNTRIES`**: `--country` 未指定時に使う対象国リスト（だいたいコード先頭からの100行目前後）
+- **`DEFAULT_MATCH_KEYWORDS`**: `--match-keyword` 未指定時に使う指標名キーワード（だいたいコード先頭からの110〜116行目前後）
+
+例:
+- 「普段はUSとJPだけを見る」→ `DEFAULT_COUNTRIES` を `["US", "JP"]` にする
+- 「ISM/CPI/NFPだけ拾いたい」→ `DEFAULT_MATCH_KEYWORDS` をそれに合わせて整理する
+
+※GitHubに公開/共有する場合は、個人の好み（通知対象）まで同梱したくなければ、Forkした側で編集する運用が安全です。
 
 ### Windowsのコマンドライン（cmd.exe / PowerShell）での入力ルール
 
